@@ -1,13 +1,14 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
+
 buildscript {
 	repositories {
-		jcenter()
-		maven { url 'https://jitpack.io' }
-		mavenCentral()
 		google()
+		jcenter()
+		mavenCentral()
+		maven { url 'https://jitpack.io' }
 	}
 	dependencies {
-		classpath 'com.android.tools.build:gradle:3.5.1'
+		classpath 'com.android.tools.build:gradle:3.5.3'
 		// NOTE: Do not place your application dependencies here; they belong
 		// in the individual module build.gradle files
 
@@ -31,6 +32,7 @@ allprojects {
 	repositories {
 		google()
 		jcenter()
+		maven { url 'https://jitpack.io' }
 	}
 }
 
@@ -105,6 +107,7 @@ android {
 	}
 	lintOptions {
 		disable 'MissingTranslation'
+		abortOnError false
 	}
 }
 
@@ -114,8 +117,9 @@ play {
 }
 
 dependencies {
-	implementation "org.scala-lang:scala-library:2.11.12"
-	//compile 'com.google.android.gms:play-services-maps:6.5.87'
-	implementation fileTree(include: ['*.jar'], dir: 'libs')
+	implementation 'org.scala-lang:scala-library:2.11.12'
+	// implementation 'com.google.android.gms:play-services-maps:6.5.87'
+	implementation fileTree(include: ['*.jar', '*.aar'], dir: 'libs')
+	// Required by updated UsbSerial library.
+	implementation 'com.squareup.okio:okio:2.1.0'
 }
-
