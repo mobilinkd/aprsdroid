@@ -184,6 +184,7 @@ z późniejszych wersji. \n\n Niniejszy program rozpowszechniany jest z nadziej�
 <string name="p_aprsis_udp">UDP (tylko wysyłanie)</string>
 <!-- array of TNC link types -->
 <string name="p_link_bt">Bluetooth SPP</string>
+<string name="p_link_ble">Bluetooth Low Energy</string>
 <string name="p_link_tcpip">TCP/IP</string>
 <string name="p_link_usb">Port szeregowy USB</string>
 <!-- array of location sources -->
