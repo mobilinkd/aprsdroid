@@ -1,45 +1,39 @@
 package org.aprsdroid.app
 
 import _root_.android.bluetooth._
-import _root_.android.app.Service
-import _root_.android.content.Intent
 import _root_.android.util.Log
 
 import _root_.java.util.UUID
-import _root_.android.bluetooth.le.BluetoothLeScanner
 import _root_.android.bluetooth.BluetoothGattCharacteristic
 import _root_.android.bluetooth.BluetoothGattCallback
 import _root_.android.bluetooth.BluetoothGatt
 import _root_.android.bluetooth.BluetoothDevice
-import _root_.android.bluetooth.BluetoothManager
-import _root_.android.bluetooth.BluetoothGattService
-import _root_.android.content.Context
 import _root_.net.ab0oo.aprs.parser._
 import android.os.Build
 
 import java.io._
 
 class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBackend(prefs) {
-	val TAG = "APRSdroid.BluetoothLE"
+	private val TAG = "APRSdroid.BluetoothLE"
 
-	val SERVICE_UUID = UUID.fromString("00000001-ba2a-46c9-ae49-01b0961f68bb")
-	val CHARACTERISTIC_UUID_RX = UUID.fromString("00000003-ba2a-46c9-ae49-01b0961f68bb")
-	val CHARACTERISTIC_UUID_TX = UUID.fromString("00000002-ba2a-46c9-ae49-01b0961f68bb")
+	private val SERVICE_UUID = UUID.fromString("00000001-ba2a-46c9-ae49-01b0961f68bb")
+	private val CHARACTERISTIC_UUID_RX = UUID.fromString("00000003-ba2a-46c9-ae49-01b0961f68bb")
+	private val CHARACTERISTIC_UUID_TX = UUID.fromString("00000002-ba2a-46c9-ae49-01b0961f68bb")
 
-	val tncmac = prefs.getString("ble.mac", null)
-	var gatt: BluetoothGatt = null
+	private val tncmac = prefs.getString("ble.mac", null)
+	private var gatt: BluetoothGatt = null
 	private var tncDevice: BluetoothDevice = null
-	var txCharacteristic: BluetoothGattCharacteristic = null
-	var rxCharacteristic: BluetoothGattCharacteristic = null
+	private var txCharacteristic: BluetoothGattCharacteristic = null
+	private var rxCharacteristic: BluetoothGattCharacteristic = null
 
-	var proto: TncProto = _
+	private var proto: TncProto = _
 
-	val bleInputStream = new BLEInputStream()
-	val bleOutputStream = new BLEOutputStream()
+	private val bleInputStream = new BLEInputStream()
+	private val bleOutputStream = new BLEOutputStream()
 
-	var conn : BLEReceiveThread = null
+	private var conn : BLEReceiveThread = null
 
-	def start() = {
+	override def start(): Boolean = {
 		if (gatt == null)
 			createConnection()
 		false
@@ -55,7 +49,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	}
 
 	private val callback = new BluetoothGattCallback {
-		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int): Unit = {
 			if (newState == BluetoothProfile.STATE_CONNECTED) {
 				Log.d(TAG, "Connected to GATT server")
 				gatt.discoverServices()
@@ -82,7 +76,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			}
 		}
 
-		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int): Unit = {
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				val gservice = gatt.getService(SERVICE_UUID)
 				if (gservice != null) {
@@ -107,7 +101,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			}
 		}
 
-		override def onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+		override def onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int): Unit = {
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				Log.d(TAG, "Characteristic write successful")
 			} else {
@@ -135,16 +129,16 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 	}
 
-	def createConnection() {
+	private def createConnection(): Unit = {
 		Log.d(TAG, "BluetoothTncBle.createConnection: " + tncmac)
-		val adapter = BluetoothAdapter.getDefaultAdapter()
+		val adapter = BluetoothAdapter.getDefaultAdapter
 
 		if (adapter == null) {
 			service.postAbort(service.getString(R.string.bt_error_unsupported))
 			return
 		}
 
-		if (!adapter.isEnabled()) {
+		if (!adapter.isEnabled) {
 			service.postAbort(service.getString(R.string.bt_error_disabled))
 			return
 		}
@@ -166,7 +160,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		conn.start()
 	}
 
-	def update(packet: APRSPacket): String = {
+	override def update(packet: APRSPacket): String = {
 		try {
 			proto.writePacket(packet)
 			"BLE OK"
@@ -185,7 +179,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 	}
 
-	def stop() {
+	override def stop(): Unit = {
 		if (gatt == null)
 			return
 			
@@ -201,11 +195,11 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		conn.join(50)
 	}
 
-	class BLEReceiveThread() extends Thread("APRSdroid Bluetooth connection") {
-		val TAG = "APRSdroid.BLEReceiveThread"
+	private class BLEReceiveThread extends Thread("APRSdroid Bluetooth connection") {
+		private val TAG = "APRSdroid.BLEReceiveThread"
 		var running = true
 
-		override def run() {
+		override def run(): Unit = {
 			running = true
 			Log.d(TAG, "BLEReceiveThread.run()")
 
@@ -225,12 +219,12 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			Log.d(TAG, "BLEReceiveThread.terminate()")
 		}
 
-		def shutdown() {
+		def shutdown(): Unit = {
 			Log.d(TAG, "shutdown()")
 		}
 	}
 
-	class BLEInputStream extends InputStream {
+	private class BLEInputStream extends InputStream {
 		private var buffer: Array[Byte] = Array()
 		var active = false
 
@@ -258,7 +252,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 	}
 
-	class BLEOutputStream extends OutputStream {
+	private class BLEOutputStream extends OutputStream {
 		private var buffer: Array[Byte] = Array()
 		private val mtuSize = 64
 		var isWaitingForAck = false
