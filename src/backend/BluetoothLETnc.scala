@@ -78,6 +78,10 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			} else {
 				Log.e(TAG, "Failed to change MTU")
 			}
+			// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
+			// Instantiate the protocol adapter and start the receive thread.
+			proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
+			conn.start()
 		}
 
 		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int): Unit = {
@@ -93,9 +97,6 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
 						gatt.writeDescriptor(descriptor)
 					}
-
-					proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
-
 					Log.d(TAG, "Services discovered and characteristics set")
 				} else {
 					Log.d(TAG, "Service not found!")
@@ -153,7 +154,6 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		connect()
 
 		conn = new BLEReceiveThread()
-		conn.start()
 	}
 
 	override def update(packet: APRSPacket): String = {
