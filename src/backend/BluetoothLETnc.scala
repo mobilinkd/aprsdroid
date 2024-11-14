@@ -14,6 +14,7 @@ import android.os.{Build, Handler, Looper}
 import java.io._
 import java.util.concurrent.Semaphore
 
+// This requires API level 21 at a minimum, API level 23 to work with dual-mode devices.
 class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBackend(prefs) {
 	private val TAG = "APRSdroid.BluetoothLE"
 
@@ -85,21 +86,20 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						}, 100)
 						reconnect = false
 					} else {
-						service.postAbort(service.getString(R.string.bt_error_connect))
+						service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
 					}
 				} else {
 					Log.d(TAG, "Disconnected from GATT server")
-					service.postAbort(service.getString(R.string.bt_error_connect))
 				}
 			}
 		}
 
 		override def onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int): Unit = {
 			if (status == BluetoothGatt.GATT_SUCCESS) {
-				Log.d(TAG, "Descriptor written successfully")
-				gatt.requestMtu(128)
+				Log.d(TAG, "Notification enabled")
+				gatt.requestMtu(517) // This requires API Level 21
 			} else {
-				Log.e(TAG, "Failed to write descriptor")
+				Log.e(TAG, f"Failed to write descriptor, status = $status")
 			}
 		}
 
@@ -131,14 +131,19 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						// the BLE callback thread is likely the problem.
 						handler.postDelayed(new Runnable {
 							override def run(): Unit = {
+								if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+									gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+								} else {
 									descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
 									gatt.writeDescriptor(descriptor)
 								}
+							}
 						}, 250)
 					}
 					Log.d(TAG, "Services discovered and characteristics set")
 				} else {
-					Log.d(TAG, "Service not found!")
+					Log.e(TAG, "KISS service not found")
+					service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
 				}
 			} else {
 				Log.d(TAG, "onServicesDiscovered received: " + status)
@@ -165,6 +170,12 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	private def createConnection(): Unit = {
 		Log.d(TAG, "BluetoothTncBle.createConnection: " + tncmac)
 		val adapter = BluetoothAdapter.getDefaultAdapter
+
+		// Lollipop may work for BLE-only devices.
+		if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+			service.postAbort(service.getString(R.string.bt_error_unsupported))
+			return
+		}
 
 		if (adapter == null) {
 			service.postAbort(service.getString(R.string.bt_error_unsupported))
@@ -206,8 +217,12 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	private def sendToBle(data: Array[Byte]): Unit = {
 		if (txCharacteristic != null && gatt != null) {
-			txCharacteristic.setValue(data)
-			gatt.writeCharacteristic(txCharacteristic)
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+				gatt.writeCharacteristic(txCharacteristic, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+			} else {
+				txCharacteristic.setValue(data)
+				gatt.writeCharacteristic(txCharacteristic)
+			}
 		}
 	}
 
