@@ -12,6 +12,7 @@ import _root_.net.ab0oo.aprs.parser._
 import android.os.Build
 
 import java.io._
+import java.util.concurrent.Semaphore
 
 class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBackend(prefs) {
 	private val TAG = "APRSdroid.BluetoothLE"
@@ -32,6 +33,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	private val bleOutputStream = new BLEOutputStream()
 
 	private var conn : BLEReceiveThread = null
+
+	private var mtu = 20 // Default BLE MTU (-3)
 
 	override def start(): Boolean = {
 		if (gatt == null)
@@ -71,6 +74,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		override def onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int): Unit = {
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				Log.d(TAG, s"MTU changed to $mtu bytes")
+				BluetoothLETnc.this.mtu = mtu - 3
 			} else {
 				Log.e(TAG, "Failed to change MTU")
 			}
@@ -108,24 +112,16 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 				Log.d(TAG, "Characteristic write failed with status: " + status)
 			}
 
-			bleOutputStream.isWaitingForAck = false
-			bleOutputStream.sendNextChunk()
+			bleOutputStream.sent()
 		}
 
-		override def onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+		override def onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Unit = {
 			Log.d(TAG, "Characteristics changed")
 
 			val data = characteristic.getValue
 
 			Log.d(TAG, "Received: " + data.length + " bytes from BLE");
-
-			bleInputStream.active = false
-
 			bleInputStream.appendData(data);
-
-			if (data.length != 64) {
-				bleInputStream.active = true
-			}
 		}
 	}
 
@@ -226,70 +222,109 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	private class BLEInputStream extends InputStream {
 		private var buffer: Array[Byte] = Array()
-		var active = false
+		private val bytesAvailable = new Semaphore(0, true)
 
 		def appendData(data: Array[Byte]): Unit = {
-			buffer ++= data
+			buffer.synchronized {
+				buffer ++= data
+				bytesAvailable.release(data.length)
+			}
 		}
 
 		override def read(): Int = {
-			if (buffer.isEmpty || !active) -1
-			else {
-				val byte = buffer.head
-				buffer = buffer.tail
-				byte & 0xFF
+			try {
+				bytesAvailable.acquire(1)
+				buffer.synchronized {
+					val byte = buffer.head
+					buffer = buffer.tail
+					byte & 0xFF
+				}
+			} catch {
+				case e : InterruptedException =>
+					Log.d(TAG, "read() interrupted")
+					-1
 			}
 		}
 
 		override def read(b: Array[Byte], off: Int, len: Int): Int = {
-			if (!active) -1
-			else {
-				val available = math.min(len, buffer.length)
-				System.arraycopy(buffer, 0, b, off, available)
-				buffer = buffer.drop(available)
-				available
+			try {
+				bytesAvailable.acquire(1)
+				buffer.synchronized {
+					val size = math.min(len, buffer.length)
+					// Expect that we have at lease size - 1 permits available.
+					if (bytesAvailable.tryAcquire(size - 1)) {
+						System.arraycopy(buffer, 0, b, off, size)
+						buffer = buffer.drop(size)
+						size
+					} else {
+						// We have one...
+						Log.e(TAG, "invalid number of semaphore permits")
+						val head = buffer.head
+						buffer = buffer.tail
+						System.arraycopy(Array(head), 0, b, off, 1)
+						1
+					}
+				}
+			} catch {
+				case e : InterruptedException =>
+					Log.d(TAG, "read() interrupted")
+					-1
 			}
 		}
 	}
 
 	private class BLEOutputStream extends OutputStream {
 		private var buffer: Array[Byte] = Array()
-		private val mtuSize = 64
-		var isWaitingForAck = false
-		
-		override def write(b: Int): Unit = {
-			Log.d(TAG, "Got data (byte): " + b.toByte)
+		private var isWaitingForAck = false
 
-			buffer ++= Array(b.toByte)
+		override def write(b: Int): Unit = {
+			Log.d(TAG, f"write 0x$b%02X")
+			buffer.synchronized {
+				buffer ++= Array(b.toByte)
+			}
 		}
+
+		private def valueOf(bytes : Array[Byte]) = bytes.map{
+			b => String.format("%02X", new java.lang.Integer(b & 0xff))
+		}.mkString
 
 		override def write(b: Array[Byte], off: Int, len: Int): Unit = {
 			val data = b.slice(off, off + len)
-			Log.d(TAG, "Got data: " + data)
-
-			buffer ++= data
+			Log.d(TAG, "write 0x" + valueOf(data))
+			buffer.synchronized {
+				buffer ++= data
+			}
 		}
 
 		override def flush(): Unit = {
 			Log.d(TAG, "Flushed. Send to BLE")
 
-			if (!isWaitingForAck) {
-				sendNextChunk()
+			isWaitingForAck.synchronized {
+				if (!isWaitingForAck) {
+					send()
+					isWaitingForAck = true
+				}
 			}
 		}
 
-		def sendNextChunk(): Unit = {
-			if (buffer.nonEmpty) {
-				val chunk = buffer.take(mtuSize)
-				buffer = buffer.drop(mtuSize)
+		private def send(): Int = {
+			buffer.synchronized {
+				if (!buffer.isEmpty) {
+					val chunk = buffer.take(mtu)
+					buffer = buffer.drop(mtu)
+					sendToBle(chunk)
+					return chunk.size
+				} else {
+					return 0
+				}
+			}
+		}
 
-				Log.d(TAG, s"Sending ${chunk.length} bytes to BLE")
-
-				sendToBle(chunk)
-
-				isWaitingForAck = true
-			} else {
-				Log.d(TAG, "No more data to send.")
+		def sent(): Unit = {
+			isWaitingForAck.synchronized {
+				if (send() == 0) {
+					isWaitingForAck = false
+				}
 			}
 		}
 	}
