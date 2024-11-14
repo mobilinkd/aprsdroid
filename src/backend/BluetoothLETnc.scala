@@ -1,6 +1,7 @@
 package org.aprsdroid.app
 
 import _root_.android.bluetooth._
+import _root_.android.content.{BroadcastReceiver, Context, Intent, IntentFilter}
 import _root_.android.util.Log
 
 import _root_.java.util.UUID
@@ -39,6 +40,46 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	private var mtu = 20 // Default BLE MTU (-3)
 
+	private def makeBleIntentFilter(): IntentFilter = {
+		val intentFilter = new IntentFilter
+		intentFilter.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+		intentFilter
+	}
+
+	// Needed to detect device bonding events.
+	private val bleReceiver = new BroadcastReceiver {
+		override def onReceive(context: Context, intent: Intent): Unit = {
+			if (tncDevice == null) return
+
+			if (intent.getAction == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
+				val device: BluetoothDevice = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+				val newState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1)
+				if (device != null && device.getAddress == tncDevice.getAddress) {
+					if (newState == BluetoothDevice.BOND_BONDED) {
+						// Only reconnect when gatt is null.
+						//
+						// We can receive BluetoothDevice.BOND_BONDED twice as part of the three-phase
+						// pairing process. The second phase goes from BONDED->BONDING->BONDED. In that
+						// case, gatt will not be null, and a reconnect should not be attempted.
+						if (gatt == null) {
+							Log.i(TAG, "TNC device bonded, reconnecting...")
+							handler.post(new Runnable {
+								override def run(): Unit = {
+									connect()
+								}
+							})
+						} else {
+							Log.i(TAG, "TNC device re-bonded")
+						}
+					} else if (newState == BluetoothDevice.BOND_NONE) {
+						Log.w(TAG, "User chose not to bond TNC")
+						service.postAbort(service.getString(R.string.bt_error_no_tnc))
+					}
+				}
+			}
+		}
+	}
+
 	override def start(): Boolean = {
 		if (gatt == null)
 			createConnection()
@@ -54,6 +95,14 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 	}
 
+	private def createBond(): Unit = {
+		if (tncDevice.createBond()) {
+			Log.i(TAG, s"Initiated bonding to $tncmac")
+		} else {
+			Log.e(TAG, "Failed to initiate bonding")
+		}
+	}
+
 	private val callback = new BluetoothGattCallback {
 		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int): Unit = {
 			if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -65,28 +114,58 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 					override def run(): Unit = { gatt.discoverServices() }
 				}, 500)
 			} else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+				// For BLE devices, there is a 3-phase pairing process on Android, requiring that the user
+				// twice approve pairing to the device. (At least this is true for dual-mode devices with
+				// an encrypted characteristic.)
+				//
+				// During phase 1 & 2, the connection is closed with an authorization error. If not bonded,
+				// the device must first be bonded. Once bonded, authorizing access to characteristics is
+				// initiated automatically, and the connection must be re-established.
+				//
+				// For dual mode devices, it may be necessary to "forget" the device in order for a BLE
+				// connection to be established. When that happens, the TNC will be in an unbonded state.
+				// We need to close the GATT connection, create the bond, then reconnect.
+				//
+				// To recap:
+				//  1. Bond
+				//  2. Grant access to characteristics requiring authorization
+				//  3. Establish connection
+				//
+				// Steps 1 and 2 typically occur once (or any time the device is "forgotten").
 				if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
 					gatt.close()
 					BluetoothLETnc.this.gatt = null
-					// The second phase of the pairing process will occur the first time an encrypted
-					// BLE characteristic is touched. This typically occurs when enabling notification
-					// on the RX characteristic, in onDescriptorWrite(). When that happens, we need to
-					// close the GATT connection and reconnect. A pairing dialog *may* appear.
-					Log.w(TAG, "Authorization error")
-					// Only try once. We don't want to spin endlessly when there is a problem. And there
-					// will be problems. When we do spin endlessly here, the only solution is for the
-					// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
-					if (reconnect) {
-						// Don't call connect() from the BLE callback thread. Also, there is a race condition
-						// here, so the call must be deferred otherwise the BLE stack can become confused.
+					if (tncDevice.getBondState == BluetoothDevice.BOND_NONE) {
+						Log.w(TAG, "Not bonded")
+						// Calling createBond() directly from here will cause the bonding process to hang.
+						// And this is another place where the interface is racy, so we need the 500ms delay.
+						// Without the delay, the odds of authorization failures goes up a bunch.
 						handler.postDelayed(new Runnable {
 							override def run(): Unit = {
-								connect()
+								createBond()
 							}
-						}, 100)
-						reconnect = false
+						}, 500)
 					} else {
-						service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
+						// The second phase of the pairing process will occur the first time an encrypted
+						// BLE characteristic is touched. This typically occurs when enabling notification
+						// on the RX characteristic, in onDescriptorWrite(). When that happens, we need to
+						// close the GATT connection and reconnect. A pairing dialog *may* appear.
+						Log.w(TAG, "Authorization error")
+						// Only try once. We don't want to spin endlessly when there is a problem. And there
+						// will be problems. When we do spin endlessly here, the only solution is for the
+						// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
+						if (reconnect) {
+							// Don't call connect() from the BLE callback thread. Also, there is a race condition
+							// here, so the call must be deferred otherwise the BLE stack can become confused.
+							handler.postDelayed(new Runnable {
+								override def run(): Unit = {
+									connect()
+								}
+							}, 100)
+							reconnect = false
+						} else {
+							service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
+						}
 					}
 				} else {
 					Log.d(TAG, "Disconnected from GATT server")
@@ -199,6 +278,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 
 		reconnect = true
+		service.registerReceiver(bleReceiver, makeBleIntentFilter())
 		connect()
 		conn = new BLEReceiveThread()
 	}
@@ -227,6 +307,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	}
 
 	override def stop(): Unit = {
+		service.unregisterReceiver(bleReceiver)
 		if (gatt == null)
 			return
 			
