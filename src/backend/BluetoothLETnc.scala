@@ -9,7 +9,7 @@ import _root_.android.bluetooth.BluetoothGattCallback
 import _root_.android.bluetooth.BluetoothGatt
 import _root_.android.bluetooth.BluetoothDevice
 import _root_.net.ab0oo.aprs.parser._
-import android.os.Build
+import android.os.{Build, Handler, Looper}
 
 import java.io._
 import java.util.concurrent.Semaphore
@@ -33,6 +33,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	private val bleOutputStream = new BLEOutputStream()
 
 	private var conn : BLEReceiveThread = null
+	private val handler = new Handler(Looper.getMainLooper)
+	private var reconnect = true
 
 	private var mtu = 20 // Default BLE MTU (-3)
 
@@ -55,10 +57,40 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int): Unit = {
 			if (newState == BluetoothProfile.STATE_CONNECTED) {
 				Log.d(TAG, "Connected to GATT server")
-				gatt.discoverServices()
+				BluetoothLETnc.this.gatt = gatt
+				// Android's BLE API is racy. Slow devices will cause timeouts and disconnects. Delay
+				// service discovery for 500ms to allow connection to complete,
+				handler.postDelayed(new Runnable {
+					override def run(): Unit = { gatt.discoverServices() }
+				}, 500)
 			} else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-				Log.d(TAG, "Disconnected from GATT server")
-				service.postAbort(service.getString(R.string.bt_error_connect))
+				if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
+					gatt.close()
+					BluetoothLETnc.this.gatt = null
+					// The second phase of the pairing process will occur the first time an encrypted
+					// BLE characteristic is touched. This typically occurs when enabling notification
+					// on the RX characteristic, in onDescriptorWrite(). When that happens, we need to
+					// close the GATT connection and reconnect. A pairing dialog *may* appear.
+					Log.w(TAG, "Authorization error")
+					// Only try once. We don't want to spin endlessly when there is a problem. And there
+					// will be problems. When we do spin endlessly here, the only solution is for the
+					// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
+					if (reconnect) {
+						// Don't call connect() from the BLE callback thread. Also, there is a race condition
+						// here, so the call must be deferred otherwise the BLE stack can become confused.
+						handler.postDelayed(new Runnable {
+							override def run(): Unit = {
+								connect()
+							}
+						}, 100)
+						reconnect = false
+					} else {
+						service.postAbort(service.getString(R.string.bt_error_connect))
+					}
+				} else {
+					Log.d(TAG, "Disconnected from GATT server")
+					service.postAbort(service.getString(R.string.bt_error_connect))
+				}
 			}
 		}
 
@@ -94,8 +126,15 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 					gatt.setCharacteristicNotification(rxCharacteristic, true)
 					val descriptor = rxCharacteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
 					if (descriptor != null) {
-						descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-						gatt.writeDescriptor(descriptor)
+						// Calling this directly, rather than delayed through the main thread, results in
+						// failed authorizations. Showing the system-generated Bluetooth pairing dialog from
+						// the BLE callback thread is likely the problem.
+						handler.postDelayed(new Runnable {
+							override def run(): Unit = {
+									descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+									gatt.writeDescriptor(descriptor)
+								}
+						}, 250)
 					}
 					Log.d(TAG, "Services discovered and characteristics set")
 				} else {
@@ -117,12 +156,9 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 
 		override def onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Unit = {
-			Log.d(TAG, "Characteristics changed")
-
 			val data = characteristic.getValue
-
-			Log.d(TAG, "Received: " + data.length + " bytes from BLE");
-			bleInputStream.appendData(data);
+			Log.d(TAG, "onCharacteristicChanged: " + data.length + " bytes from BLE")
+			bleInputStream.appendData(data)
 		}
 	}
 
@@ -151,8 +187,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			return
 		}
 
+		reconnect = true
 		connect()
-
 		conn = new BLEReceiveThread()
 	}
 
@@ -208,7 +244,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						service.postSubmit(line)
 					}
 				} catch {
-					case e : Exception => 
+					case e : Exception =>
 						Log.d("ProtoTNC", "proto.readPacket exception")
 				}
 			}
