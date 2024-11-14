@@ -4,6 +4,7 @@ import _root_.android.bluetooth._
 import _root_.android.app.Service
 import _root_.android.content.Intent
 import _root_.android.util.Log
+
 import _root_.java.util.UUID
 import _root_.android.bluetooth.le.BluetoothLeScanner
 import _root_.android.bluetooth.BluetoothGattCharacteristic
@@ -13,8 +14,9 @@ import _root_.android.bluetooth.BluetoothDevice
 import _root_.android.bluetooth.BluetoothManager
 import _root_.android.bluetooth.BluetoothGattService
 import _root_.android.content.Context
-
 import _root_.net.ab0oo.aprs.parser._
+import android.os.Build
+
 import java.io._
 
 class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBackend(prefs) {
@@ -26,6 +28,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	val tncmac = prefs.getString("ble.mac", null)
 	var gatt: BluetoothGatt = null
+	private var tncDevice: BluetoothDevice = null
 	var txCharacteristic: BluetoothGattCharacteristic = null
 	var rxCharacteristic: BluetoothGattCharacteristic = null
 
@@ -40,6 +43,96 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		if (gatt == null)
 			createConnection()
 		false
+	}
+
+	private def connect(): Unit = {
+		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+			gatt = tncDevice.connectGatt(service, false, callback, BluetoothDevice.TRANSPORT_LE)
+		} else {
+			// Dual-mode devices are not supported
+			gatt = tncDevice.connectGatt(service, false, callback)
+		}
+	}
+
+	private val callback = new BluetoothGattCallback {
+		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+			if (newState == BluetoothProfile.STATE_CONNECTED) {
+				Log.d(TAG, "Connected to GATT server")
+				gatt.discoverServices()
+			} else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+				Log.d(TAG, "Disconnected from GATT server")
+				service.postAbort(service.getString(R.string.bt_error_connect))
+			}
+		}
+
+		override def onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int): Unit = {
+			if (status == BluetoothGatt.GATT_SUCCESS) {
+				Log.d(TAG, "Descriptor written successfully")
+				gatt.requestMtu(128)
+			} else {
+				Log.e(TAG, "Failed to write descriptor")
+			}
+		}
+
+		override def onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int): Unit = {
+			if (status == BluetoothGatt.GATT_SUCCESS) {
+				Log.d(TAG, s"MTU changed to $mtu bytes")
+			} else {
+				Log.e(TAG, "Failed to change MTU")
+			}
+		}
+
+		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+			if (status == BluetoothGatt.GATT_SUCCESS) {
+				val gservice = gatt.getService(SERVICE_UUID)
+				if (gservice != null) {
+					txCharacteristic = gservice.getCharacteristic(CHARACTERISTIC_UUID_TX)
+					rxCharacteristic = gservice.getCharacteristic(CHARACTERISTIC_UUID_RX)
+
+					gatt.setCharacteristicNotification(rxCharacteristic, true)
+					val descriptor = rxCharacteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
+					if (descriptor != null) {
+						descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+						gatt.writeDescriptor(descriptor)
+					}
+
+					proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
+
+					Log.d(TAG, "Services discovered and characteristics set")
+				} else {
+					Log.d(TAG, "Service not found!")
+				}
+			} else {
+				Log.d(TAG, "onServicesDiscovered received: " + status)
+			}
+		}
+
+		override def onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+			if (status == BluetoothGatt.GATT_SUCCESS) {
+				Log.d(TAG, "Characteristic write successful")
+			} else {
+				Log.d(TAG, "Characteristic write failed with status: " + status)
+			}
+
+			bleOutputStream.isWaitingForAck = false
+			bleOutputStream.sendNextChunk()
+		}
+
+		override def onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+			Log.d(TAG, "Characteristics changed")
+
+			val data = characteristic.getValue
+
+			Log.d(TAG, "Received: " + data.length + " bytes from BLE");
+
+			bleInputStream.active = false
+
+			bleInputStream.appendData(data);
+
+			if (data.length != 64) {
+				bleInputStream.active = true
+			}
+		}
 	}
 
 	def createConnection() {
@@ -61,87 +154,13 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			return
 		}
 
-		val device = adapter.getRemoteDevice(tncmac)
-		gatt = device.connectGatt(service, false, new BluetoothGattCallback {
-			override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-				if (newState == BluetoothProfile.STATE_CONNECTED) {
-					Log.d(TAG, "Connected to GATT server")
-					gatt.discoverServices()
-				} else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-					Log.d(TAG, "Disconnected from GATT server")
-					service.postAbort(service.getString(R.string.bt_error_connect))
-				}
-			}
+		tncDevice = BluetoothAdapter.getDefaultAdapter.getRemoteDevice(tncmac)
+		if (tncDevice == null) {
+			service.postAbort(service.getString(R.string.bt_error_no_tnc))
+			return
+		}
 
-			override def onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int): Unit = {
-				if (status == BluetoothGatt.GATT_SUCCESS) {
-					Log.d(TAG, "Descriptor written successfully")
-					gatt.requestMtu(128)
-				} else {
-					Log.e(TAG, "Failed to write descriptor")
-				}
-			}
-
-			override def onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int): Unit = {
-				if (status == BluetoothGatt.GATT_SUCCESS) {
-					Log.d(TAG, s"MTU changed to $mtu bytes")
-				} else {
-					Log.e(TAG, "Failed to change MTU")
-				}
-			}
-
-			override def onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-				if (status == BluetoothGatt.GATT_SUCCESS) {
-				val gservice = gatt.getService(SERVICE_UUID)
-				if (gservice != null) {
-					txCharacteristic = gservice.getCharacteristic(CHARACTERISTIC_UUID_TX)
-					rxCharacteristic = gservice.getCharacteristic(CHARACTERISTIC_UUID_RX)
-
-					gatt.setCharacteristicNotification(rxCharacteristic, true)
-					val descriptor = rxCharacteristic.getDescriptor(UUID.fromString("00002902-0000-1000-8000-00805f9b34fb"))
-					if (descriptor != null) {
-						descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-						gatt.writeDescriptor(descriptor)
-					}
-
-					proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
-				
-					Log.d(TAG, "Services discovered and characteristics set")
-				} else {
-					Log.d(TAG, "Service not found!")
-				}
-				} else {
-					Log.d(TAG, "onServicesDiscovered received: " + status)
-				}
-			}
-
-			override def onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-				if (status == BluetoothGatt.GATT_SUCCESS) {
-					Log.d(TAG, "Characteristic write successful")
-				} else {
-					Log.d(TAG, "Characteristic write failed with status: " + status)
-				}
-
-				bleOutputStream.isWaitingForAck = false
-				bleOutputStream.sendNextChunk()
-			}
-
-			override def onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-				Log.d(TAG, "Characteristics changed")
-
-				val data = characteristic.getValue
-
-				Log.d(TAG, "Received: " + data.length + " bytes from BLE");
-
-				bleInputStream.active = false
-				
-				bleInputStream.appendData(data);
-
-				if (data.length != 64) {
-					bleInputStream.active = true
-				}
-			}
-		})
+		connect()
 
 		conn = new BLEReceiveThread()
 		conn.start()
