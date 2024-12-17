@@ -85,9 +85,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 				//
 				// Steps 1 and 2 typically occur once (or any time the device is "forgotten").
 				if (status == BluetoothGatt.GATT_INSUFFICIENT_AUTHORIZATION) {
-					gatt.close()
-					BluetoothLETnc.this.gatt = null
 					if (tncDevice.getBondState == BluetoothDevice.BOND_NONE) {
+						Log.w(TAG, f"${tncDevice.getName} no longer bonded")
 						service.postAbort(service.getString(R.string.bt_error_no_tnc))
 					} else {
 						// The second phase of the pairing process will occur the first time an encrypted
@@ -100,6 +99,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
 						if (reconnect) {
 							reconnect = false
+							gatt.close()
 							connect()
 						} else {
 							service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
@@ -120,6 +120,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 				}
 			} else {
 				Log.e(TAG, f"Failed to write descriptor, status = $status")
+				service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
 			}
 		}
 
@@ -130,15 +131,13 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			} else {
 				Log.e(TAG, "Failed to change MTU")
 			}
+
+			if (rxCharacteristic == null) return // Android 13 bug: Service Discovery has not completed.
+
 			// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
-			// Start the receive thread and instantiate the protocol adapter.
-			conn.start()
+			// Instantiate the protocol adapter and start the receive thread.
 			proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
-			try { // Attempt to start the poster (with exception handling)
-				service.postPosterStarted()
-			} catch {
-				case e: Exception => Log.d("ProtoTNC", "Exception in postPosterStarted: " + e.getMessage)
-			}
+			conn.start()
 		}
 
 		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int): Unit = {
@@ -229,6 +228,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 
 		reconnect = true
+		rxCharacteristic = null
+		txCharacteristic = null
 		connect()
 		conn = new BLEReceiveThread()
 	}
@@ -257,16 +258,19 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	}
 
 	override def stop(): Unit = {
-		if (gatt == null)
-			return
-			
-		gatt.disconnect()
-		gatt.close()
-		gatt = null
-		
-		conn.synchronized {
-			conn.running = false
+		if (gatt != null) {
+			gatt.close()
+			gatt = null
 		}
+
+		conn.synchronized {
+			if (!conn.running) {
+				return
+			} else {
+				conn.running = false
+			}
+		}
+
 		conn.shutdown()
 		conn.interrupt()
 		conn.join(50)
@@ -277,7 +281,10 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		var running = true
 
 		override def run(): Unit = {
-			running = true
+			this.synchronized {
+				running = true
+			}
+
 			Log.d(TAG, "BLEReceiveThread.run()")
 
 			while (running) {
