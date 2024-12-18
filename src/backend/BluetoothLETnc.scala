@@ -56,6 +56,29 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		}
 	}
 
+	private def tryReconnect(): Boolean = {
+		// Only retry once. We don't want to spin endlessly when there is a problem. And there
+		// will be problems. When we do spin endlessly here, the only solution is for the
+		// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
+		if (reconnect) {
+			reconnect = false
+			gatt.close()
+			connect()
+			return true
+		} else {
+			return false
+		}
+	}
+
+	private def connectionEstablished(): Unit = {
+		// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
+		// Instantiate the protocol adapter and start the receive thread. Errors are logged if these
+		// are done out of order.
+		reconnect = false
+		proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
+		conn.start()
+	}
+
 	private val callback = new BluetoothGattCallback {
 		override def onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int): Unit = {
 			if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -94,18 +117,18 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 						// on the RX characteristic, in onDescriptorWrite(). When that happens, we need to
 						// close the GATT connection and reconnect. A pairing dialog *may* appear.
 						Log.w(TAG, "Authorization error")
-						// Only try once. We don't want to spin endlessly when there is a problem. And there
-						// will be problems. When we do spin endlessly here, the only solution is for the
-						// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
-						if (reconnect) {
-							reconnect = false
-							gatt.close()
-							connect()
-						} else {
+						if (!tryReconnect()) {
 							service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
 						}
 					}
+				} else if (status != BluetoothGatt.GATT_SUCCESS) {
+					// Unexpected error.
+					Log.e(TAG, f"Unexpected disconnect, status = $status")
+					if (!tryReconnect()) {
+						service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
+					}
 				} else {
+					// The expectation here is that the disconnect was initiated by the app directly.
 					Log.d(TAG, "Disconnected from GATT server")
 				}
 			}
@@ -115,8 +138,8 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				Log.d(TAG, "Notification enabled")
 				if (!gatt.requestMtu(517)) { // This requires API Level 21
-					Log.e(TAG, "Could not request MTU change")
-					service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
+					Log.w(TAG, "Could not request MTU change")
+					connectionEstablished()
 				}
 			} else {
 				Log.e(TAG, f"Failed to write descriptor, status = $status")
@@ -132,12 +155,10 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 				Log.e(TAG, "Failed to change MTU")
 			}
 
-			if (rxCharacteristic == null) return // Android 13 bug: Service Discovery has not completed.
-
-			// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
-			// Instantiate the protocol adapter and start the receive thread.
-			proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
-			conn.start()
+			// Work around Android bug; make sure Service Discovery has completed.
+			if (rxCharacteristic != null) {
+				connectionEstablished()
+			}
 		}
 
 		override def onServicesDiscovered(gatt: BluetoothGatt, status: Int): Unit = {
@@ -259,6 +280,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	override def stop(): Unit = {
 		if (gatt != null) {
+			gatt.disconnect()
 			gatt.close()
 			gatt = null
 		}
