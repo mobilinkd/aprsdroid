@@ -1,7 +1,6 @@
 package org.aprsdroid.app
 
 import _root_.android.bluetooth._
-import _root_.android.content.{BroadcastReceiver, Context, Intent, IntentFilter}
 import _root_.android.util.Log
 
 import _root_.java.util.UUID
@@ -10,7 +9,7 @@ import _root_.android.bluetooth.BluetoothGattCallback
 import _root_.android.bluetooth.BluetoothGatt
 import _root_.android.bluetooth.BluetoothDevice
 import _root_.net.ab0oo.aprs.parser._
-import android.os.{Build, Handler, Looper}
+import android.os.Build
 
 import java.io._
 import java.util.concurrent.Semaphore
@@ -35,9 +34,19 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	private val bleOutputStream = new BLEOutputStream()
 
 	private var conn : BLEReceiveThread = null
-	private var reconnect = true
+	private var retries = 1
+	private var reconnect = false
 
 	private var mtu = 20 // Default BLE MTU (-3)
+
+	private def info(id : Integer, args : Object*) {
+		service.postAddPost(StorageDatabase.Post.TYPE_INFO, R.string.post_info, service.getString(id, args : _*))
+	}
+
+	private def error(id : Integer, args : Object*) {
+		service.postAddPost(StorageDatabase.Post.TYPE_INFO, R.string.post_error, service.getString(id, args : _*))
+	}
+
 
 	override def start(): Boolean = {
 		if (gatt == null)
@@ -48,6 +57,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 	private def connect(): Unit = {
 		// Must use application context here, otherwise authorization dialogs always fail, and
 		// other GATT operations intermittently fail.
+		info(R.string.ble_connecting, tncmac)
 		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
 			gatt = tncDevice.connectGatt(service.getApplicationContext, false, callback, BluetoothDevice.TRANSPORT_LE)
 		} else {
@@ -60,9 +70,30 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		// Only retry once. We don't want to spin endlessly when there is a problem. And there
 		// will be problems. When we do spin endlessly here, the only solution is for the
 		// user to disable and re-enable Bluetooth on the device. ¯\_(ツ)_/¯
-		if (reconnect) {
-			reconnect = false
+		if (reconnect || retries > 0) {
 			gatt.close()
+			conn.synchronized {
+				if (conn.running) {
+					conn.running = false
+					conn.shutdown()
+					conn.interrupt()
+					conn.join(50)
+				}
+			}
+
+			if (retries > 0) {
+				retries -= 1
+			} else { // reconnect == true
+				// Same reconnect logic as BluetoothTnc code.
+				info(R.string.bt_reconnecting)
+				try {
+					Thread.sleep(3 * 1000) // It *should* be safe to sleeo here since the connection is closed.
+				} catch {
+					case _:InterruptedException =>
+						return false
+				}
+			}
+			conn = new BLEReceiveThread()
 			connect()
 			return true
 		} else {
@@ -74,8 +105,10 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
 		// Instantiate the protocol adapter and start the receive thread. Errors are logged if these
 		// are done out of order.
-		reconnect = false
+		reconnect = true 	// Always attempt to reconnect if the connection is not explicitly closed.
+		retries = 0				// No longer need to retry.
 		proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
+		info(R.string.bt_connected)
 		conn.start()
 	}
 
@@ -124,6 +157,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 				} else if (status != BluetoothGatt.GATT_SUCCESS) {
 					// Unexpected error.
 					Log.e(TAG, f"Unexpected disconnect, status = $status")
+					error(R.string.ble_disconnect, status.toString)
 					if (!tryReconnect()) {
 						service.postAbort(service.getString(R.string.bt_error_connect, tncDevice.getName))
 					}
@@ -137,6 +171,12 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		override def onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int): Unit = {
 			if (status == BluetoothGatt.GATT_SUCCESS) {
 				Log.d(TAG, "Notification enabled")
+				if (!gatt.requestMtu(517)) { // This requires API Level 21
+					Log.w(TAG, "Could not request MTU change")
+					connectionEstablished()
+				}
+			} else if (status == 4) { // INVALID_PDU
+				Log.e(TAG, "Invalid PDU")
 				if (!gatt.requestMtu(517)) { // This requires API Level 21
 					Log.w(TAG, "Could not request MTU change")
 					connectionEstablished()
@@ -248,11 +288,12 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			return
 		}
 
-		reconnect = true
+		reconnect = false // Don't enable reconnect logic until the connection is completely established.
+		retries = 1       // Retry opening the connection once.
 		rxCharacteristic = null
 		txCharacteristic = null
-		connect()
 		conn = new BLEReceiveThread()
+		connect()
 	}
 
 	override def update(packet: APRSPacket): String = {
@@ -280,6 +321,7 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 	override def stop(): Unit = {
 		if (gatt != null) {
+			reconnect = false
 			gatt.disconnect()
 			gatt.close()
 			gatt = null
