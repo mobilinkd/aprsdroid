@@ -4,6 +4,7 @@ import _root_.android.content.Context
 import _root_.android.location.{Location, LocationManager}
 import _root_.android.media.AudioManager
 import _root_.android.preference.PreferenceManager
+import _root_.android.os.Build
 
 class PrefsWrapper(val context : Context) {
 	val prefs = PreferenceManager.getDefaultSharedPreferences(context)
@@ -75,7 +76,14 @@ class PrefsWrapper(val context : Context) {
 		val link = AprsBackend.defaultProtoInfo(this).link
 		link match {
 		case "aprsis" => "%s, %s".format(proto, getListItemName(link, AprsBackend.DEFAULT_CONNTYPE, R.array.p_aprsis_ev, R.array.p_aprsis_e))
-		case "link" => "%s, %s".format(proto, getListItemName(link, AprsBackend.DEFAULT_CONNTYPE, R.array.p_link_ev, R.array.p_link_e))
+		case "link" => {
+			if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+				// Support BLE on OREO (Android 8.0) or greater.
+				"%s, %s".format(proto, getListItemName(link, AprsBackend.DEFAULT_CONNTYPE, R.array.p_link_ev, R.array.p_link_e))
+			} else {
+				"%s, %s".format(proto, getListItemName(link, AprsBackend.DEFAULT_CONNTYPE, R.array.p_link_ble_ev, R.array.p_link_ble_e))
+			}
+		}
 		case _ => proto
 		}
 	}
