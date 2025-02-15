@@ -9,7 +9,7 @@ import _root_.android.bluetooth.BluetoothGattCallback
 import _root_.android.bluetooth.BluetoothGatt
 import _root_.android.bluetooth.BluetoothDevice
 import _root_.net.ab0oo.aprs.parser._
-import android.os.Build
+import _root_.android.os.Build
 
 import java.io._
 import java.util.concurrent.Semaphore
@@ -351,9 +351,16 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 
 			Log.d(TAG, "BLEReceiveThread.run()")
 
+			try {
+				// Attempt to start the poster (with exception handling)
+				service.postPosterStarted()
+			} catch {
+				case e: Exception =>
+					Log.d("ProtoTNC", "Exception in postPosterStarted: " + e.getMessage)
+			}
+
 			while (running) {
 				try {
-					// Log.d(TAG, "waiting for data...")
 					while (running) {
 						val line = proto.readPacket()
 						Log.d(TAG, "recv: " + line)
