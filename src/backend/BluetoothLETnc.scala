@@ -105,11 +105,22 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 		// Once the MTU callback is complete, whether successful or not, we're ready to rock & roll.
 		// Instantiate the protocol adapter and start the receive thread. Errors are logged if these
 		// are done out of order.
+		val wasReconnected = reconnect
 		reconnect = true 	// Always attempt to reconnect if the connection is not explicitly closed.
 		retries = 0				// No longer need to retry.
 		proto = AprsBackend.instanciateProto(service, bleInputStream, bleOutputStream)
 		info(R.string.bt_connected)
 		conn.start()
+
+		if (!wasReconnected) {
+			try {
+				// Attempt to start the poster (with exception handling)
+				service.postPosterStarted()
+			} catch {
+				case e: Exception =>
+					Log.d("ProtoTNC", "Exception in postPosterStarted: " + e.getMessage)
+			}
+		}
 	}
 
 	private val callback = new BluetoothGattCallback {
@@ -350,14 +361,6 @@ class BluetoothLETnc(service : AprsService, prefs : PrefsWrapper) extends AprsBa
 			}
 
 			Log.d(TAG, "BLEReceiveThread.run()")
-
-			try {
-				// Attempt to start the poster (with exception handling)
-				service.postPosterStarted()
-			} catch {
-				case e: Exception =>
-					Log.d("ProtoTNC", "Exception in postPosterStarted: " + e.getMessage)
-			}
 
 			while (running) {
 				try {
